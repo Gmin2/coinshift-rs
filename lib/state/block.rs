@@ -880,3 +880,340 @@ pub fn disconnect_tip(
         .map_err(DbError::from)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod bug_block_path_swap_handling {
+    use super::*;
+    use crate::state::PrevalidatedBlock;
+    use crate::state::test_env::fresh_env;
+    use crate::types::{
+        AccumulatorDiff, Address, Body, Header, Output, OutputContent,
+        ParentChainType, Swap, SwapDirection, Transaction, Txid,
+    };
+
+    fn build_pre(
+        txs: Vec<Transaction>,
+        next_height: u32,
+    ) -> (Header, Body, PrevalidatedBlock) {
+        build_pre_with_spent(
+            txs.iter().map(|t| (t.clone(), Vec::new())).collect(),
+            next_height,
+        )
+    }
+
+    fn build_pre_with_spent(
+        txs_with_spent: Vec<(Transaction, Vec<Output>)>,
+        next_height: u32,
+    ) -> (Header, Body, PrevalidatedBlock) {
+        let txs: Vec<Transaction> =
+            txs_with_spent.iter().map(|(t, _)| t.clone()).collect();
+        let body = Body {
+            coinbase: Vec::new(),
+            transactions: txs.clone(),
+            authorizations: Vec::new(),
+        };
+        let filled: Vec<FilledTransaction> = txs_with_spent
+            .iter()
+            .map(|(t, spent)| FilledTransaction {
+                transaction: t.clone(),
+                spent_utxos: spent.clone(),
+            })
+            .collect();
+        let merkle_root =
+            Body::compute_merkle_root(&body.coinbase, filled.as_slice())
+                .unwrap();
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::from_raw_hash(
+                bitcoin::hashes::Hash::all_zeros(),
+            ),
+            roots: Vec::new(),
+        };
+        let pre = PrevalidatedBlock {
+            filled_transactions: filled,
+            computed_merkle_root: merkle_root,
+            total_fees: bitcoin::Amount::ZERO,
+            coinbase_value: bitcoin::Amount::ZERO,
+            next_height,
+            accumulator_diff: AccumulatorDiff::default(),
+        };
+        (header, body, pre)
+    }
+
+    fn pending_open_swap(swap_id: SwapId) -> Swap {
+        Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::Hash32([0u8; 32]),
+            Some(1),
+            None,
+            bitcoin::Amount::from_sat(1_000_000),
+            Some("bcrt1qx".to_string()),
+            Some(bitcoin::Amount::from_sat(500_000)),
+            0,
+            None,
+            None,
+        )
+    }
+
+    /// The block connect path advances a NON-ReadyToClaim swap to
+    /// ReadyToClaim (then Completed) without running validate_swap_claim. A
+    /// SwapClaim for a swap that never saw an L1 fill is accepted in a block.
+    #[test]
+    fn block_swapclaim_promotes_pending_swap_without_validation() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let swap_id = SwapId([0x21; 32]);
+        // SwapPending output is funded as a live UTXO and locked to the swap.
+        let pending_outpoint = OutPoint::Regular {
+            txid: Txid::from([0x01; 32]),
+            vout: 0,
+        };
+        let pending_output = Output {
+            address: Address([0x01; 20]),
+            content: OutputContent::SwapPending {
+                value: bitcoin::Amount::from_sat(1_000_000),
+                swap_id: swap_id.0,
+            },
+        };
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            let swap = pending_open_swap(swap_id);
+            assert_eq!(swap.state, SwapState::Pending);
+            state.save_swap(&mut rwtxn, &swap).unwrap();
+            state
+                .utxos
+                .put(&mut rwtxn, &(&pending_outpoint).into(), &pending_output)
+                .unwrap();
+            state
+                .lock_output_to_swap(&mut rwtxn, &pending_outpoint, &swap_id)
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let attacker = Address([0xEE; 20]);
+        let claim = Transaction {
+            inputs: vec![(pending_outpoint, crate::types::Hash::default())],
+            proof: Default::default(),
+            outputs: Vec::new(), // block path doesn't require an output
+            data: TxData::SwapClaim {
+                swap_id: swap_id.0,
+                l2_claimer_address: Some(attacker),
+                proof_data: None,
+            },
+        };
+
+        let (header, body, pre) = build_pre(vec![claim], 0);
+        let mut rwtxn = env.write_txn().unwrap();
+        let res = connect_prevalidated(&state, &mut rwtxn, &header, &body, pre);
+        assert!(
+            res.is_ok(),
+            "block connect should accept SwapClaim for a Pending swap (no swap validation), got {res:?}"
+        );
+        let swap = state.get_swap(&rwtxn, &swap_id).unwrap().unwrap();
+        assert_eq!(
+            swap.state,
+            SwapState::Completed,
+            "Pending swap was completed by a block-level SwapClaim with no L1 fill"
+        );
+        rwtxn.commit().unwrap();
+        println!(
+            "proven: connect_prevalidated accepted a SwapClaim for a Pending (never-filled) swap, promoting it to ReadyToClaim then Completed without calling validate_swap_claim"
+        );
+    }
+
+    /// The block connect path applies a TxData::Regular spend of a
+    /// locked SwapPending output (validate_no_locked_outputs is never called on
+    /// the block path), consuming the locked output into an ordinary output.
+    #[test]
+    fn block_regular_spend_of_locked_output() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let swap_id = SwapId([0x22; 32]);
+        let bob = Address([0xBB; 20]);
+        let locked_outpoint = OutPoint::Regular {
+            txid: Txid::from([0x02; 32]),
+            vout: 0,
+        };
+        // Pre-specified swap: SwapPending output addressed to recipient Bob.
+        let locked_output = Output {
+            address: bob,
+            content: OutputContent::SwapPending {
+                value: bitcoin::Amount::from_sat(1_000_000),
+                swap_id: swap_id.0,
+            },
+        };
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state
+                .utxos
+                .put(&mut rwtxn, &(&locked_outpoint).into(), &locked_output)
+                .unwrap();
+            state
+                .lock_output_to_swap(&mut rwtxn, &locked_outpoint, &swap_id)
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        // Sanity: the transaction-admission path WOULD reject this.
+        {
+            let rotxn = env.read_txn().unwrap();
+            let regular = Transaction {
+                inputs: vec![(locked_outpoint, crate::types::Hash::default())],
+                proof: Default::default(),
+                outputs: vec![Output {
+                    address: bob,
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        1_000_000,
+                    )),
+                }],
+                data: TxData::Regular,
+            };
+            let admission =
+                crate::state::swap::validate_no_locked_outputs(
+                    &state, &rotxn, &regular,
+                );
+            assert!(
+                admission.is_err(),
+                "mempool/admission path must reject a regular spend of a locked output"
+            );
+        }
+
+        // But the block path consumes it.
+        let regular = Transaction {
+            inputs: vec![(locked_outpoint, crate::types::Hash::default())],
+            proof: Default::default(),
+            outputs: vec![Output {
+                address: bob,
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    1_000_000,
+                )),
+            }],
+            data: TxData::Regular,
+        };
+        let (header, body, pre) = build_pre_with_spent(
+            vec![(regular, vec![locked_output.clone()])],
+            0,
+        );
+        let mut rwtxn = env.write_txn().unwrap();
+        let res = connect_prevalidated(&state, &mut rwtxn, &header, &body, pre);
+        assert!(
+            res.is_ok(),
+            "block path should accept a regular spend of a locked output, got {res:?}"
+        );
+        // The locked output is now spent (moved to stxos).
+        assert!(
+            state
+                .utxos
+                .try_get(&rwtxn, &(&locked_outpoint).into())
+                .unwrap()
+                .is_none(),
+            "locked output should have been consumed by the block"
+        );
+        rwtxn.commit().unwrap();
+        println!(
+            "proven: a TxData::Regular spend of a locked SwapPending output is rejected by validate_no_locked_outputs but accepted and applied by connect_prevalidated (block path skips the locked-output rule)"
+        );
+    }
+
+    /// After the block path completes a never-ready swap, disconnecting
+    /// that block restores the swap to ReadyToClaim (not its true prior Pending
+    /// state), because the rollback unconditionally writes ReadyToClaim for any
+    /// Completed swap with no saved prior state.
+    #[test]
+    fn disconnect_restores_completed_swap_to_ready_to_claim() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let swap_id = SwapId([0x23; 32]);
+        let pending_outpoint = OutPoint::Regular {
+            txid: Txid::from([0x03; 32]),
+            vout: 0,
+        };
+        let pending_output = Output {
+            address: Address([0x01; 20]),
+            content: OutputContent::SwapPending {
+                value: bitcoin::Amount::from_sat(1_000_000),
+                swap_id: swap_id.0,
+            },
+        };
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            let swap = pending_open_swap(swap_id);
+            assert_eq!(swap.state, SwapState::Pending);
+            state.save_swap(&mut rwtxn, &swap).unwrap();
+            state
+                .utxos
+                .put(&mut rwtxn, &(&pending_outpoint).into(), &pending_output)
+                .unwrap();
+            state
+                .lock_output_to_swap(&mut rwtxn, &pending_outpoint, &swap_id)
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let attacker = Address([0xEE; 20]);
+        // SwapClaim with NO outputs so disconnect only restores the spent input
+        // (no output/coinbase accumulator removals on the empty accumulator).
+        let claim = Transaction {
+            inputs: vec![(pending_outpoint, crate::types::Hash::default())],
+            proof: Default::default(),
+            outputs: Vec::new(),
+            data: TxData::SwapClaim {
+                swap_id: swap_id.0,
+                l2_claimer_address: Some(attacker),
+                proof_data: None,
+            },
+        };
+
+        let (header, body, pre) = build_pre(vec![claim], 0);
+
+        // Connect the malicious block.
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            connect_prevalidated(
+                &state,
+                &mut rwtxn,
+                &header,
+                &body,
+                pre,
+            )
+            .unwrap();
+            rwtxn.commit().unwrap();
+        }
+        {
+            let rotxn = env.read_txn().unwrap();
+            assert_eq!(
+                state.get_swap(&rotxn, &swap_id).unwrap().unwrap().state,
+                SwapState::Completed
+            );
+        }
+
+        // Disconnect it (reorg). The genuine prior state was Pending.
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            disconnect_tip(&state, &mut rwtxn, &header, &body).unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let rotxn = env.read_txn().unwrap();
+        let swap = state.get_swap(&rotxn, &swap_id).unwrap().unwrap();
+        assert_eq!(
+            swap.state,
+            SwapState::ReadyToClaim,
+            "rollback should have left the swap ReadyToClaim (the bug), not its true prior Pending"
+        );
+        assert_ne!(
+            swap.state,
+            SwapState::Pending,
+            "the genuine prior state Pending was NOT restored"
+        );
+        println!(
+            "proven: after connecting then disconnecting a block-level SwapClaim, the swap is left ReadyToClaim instead of its true prior Pending; the locked input is re-locked but the swap can now be claimed on the canonical chain"
+        );
+    }
+}

@@ -2003,3 +2003,403 @@ impl Watchable<()> for State {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
     }
 }
+
+/// Shared helpers for the dynamic bug repro tests.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use sneed::Env;
+
+    /// Open a fresh on-disk sneed env in a unique temp dir.
+    pub fn fresh_env() -> Env {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir()
+            .join(format!("coinshift_bug_repro_{pid}_{n}"));
+        let remove_res = std::fs::remove_dir_all(&path);
+        drop(remove_res);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(16 * 1024 * 1024).max_dbs(super::State::NUM_DBS);
+        unsafe { Env::open(&opts, &path) }.unwrap()
+    }
+}
+
+/// State::update_swap_l1_txid accepts a caller-supplied (fake) L1 txid
+/// and promotes the swap to ReadyToClaim with no parent-chain verification.
+#[cfg(test)]
+mod bug_fake_l1_txid_promotion {
+    use super::test_env::fresh_env;
+    use super::*;
+    use crate::types::{
+        Address, ParentChainType, Swap, SwapDirection, SwapId, SwapState,
+        SwapTxId,
+    };
+
+    #[test]
+    fn fake_l1_txid_marks_open_swap_ready_to_claim() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        // Open swap (l2_recipient = None), 1 required confirmation.
+        let swap_id = SwapId([0x11; 32]);
+        let swap = Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::Hash32([0u8; 32]),
+            Some(1),
+            None, // open swap
+            bitcoin::Amount::from_sat(1_000_000),
+            Some("bcrt1qvictim".to_string()),
+            Some(bitcoin::Amount::from_sat(500_000)),
+            0,
+            None,
+            None,
+        );
+
+        let attacker_l2 = Address([0xAA; 20]);
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state.save_swap(&mut rwtxn, &swap).unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        // Attacker calls with a totally fabricated L1 txid and their own L2 addr.
+        let fake_l1_txid =
+            SwapTxId::from_hex(&"cc".repeat(32)).unwrap();
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state
+                .update_swap_l1_txid(
+                    &mut rwtxn,
+                    &swap_id,
+                    fake_l1_txid,
+                    1, // confirmations supplied by caller
+                    None,
+                    Some(attacker_l2),
+                    BlockHash([0u8; 32]),
+                    0,
+                )
+                .expect("update with fake L1 txid should be accepted");
+            rwtxn.commit().unwrap();
+        }
+
+        let rotxn = env.read_txn().unwrap();
+        let updated = state.get_swap(&rotxn, &swap_id).unwrap().unwrap();
+        assert_eq!(
+            updated.state,
+            SwapState::ReadyToClaim,
+            "fake L1 txid must NOT have been verified, yet swap is ReadyToClaim"
+        );
+        assert_eq!(
+            updated.l2_claimer_address,
+            Some(attacker_l2),
+            "attacker recorded as claimer with no L1 proof"
+        );
+        println!(
+            "proven: open swap promoted to ReadyToClaim from a fabricated L1 txid (cc..cc), attacker stored as L2 claimer; no parent-chain inclusion check"
+        );
+    }
+}
+
+/// sidechain_wealth withdrawal-STXO branch reads from
+/// total_deposit_stxo_value, so withdrawal STXOs are not accumulated and the
+/// reported wealth is wrong.
+#[cfg(test)]
+mod bug_sidechain_wealth_accounting {
+    use super::test_env::fresh_env;
+    use super::*;
+    use crate::types::{
+        Address, InPoint, M6id, OutPoint, Output, OutputContent, SpentOutput,
+        Txid,
+    };
+
+    fn withdrawal_stxo(value_sats: u64) -> SpentOutput {
+        SpentOutput {
+            output: Output {
+                address: Address([0u8; 20]),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    value_sats,
+                )),
+            },
+            inpoint: InPoint::Withdrawal {
+                m6id: M6id(bitcoin::Txid::from_raw_hash(
+                    bitcoin::hashes::Hash::all_zeros(),
+                )),
+            },
+        }
+    }
+
+    #[test]
+    fn withdrawal_total_overwrites_instead_of_accumulating() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        // Give a large deposit UTXO baseline so subtraction never underflows.
+        // deposit UTXO = 1000 sats.
+        // withdrawal STXOs = 10 and 20 sats (no deposit STXOs).
+        // Correct wealth = 1000 + 0 - (10 + 20) = 970.
+        // Buggy wealth: withdrawal total never sums; it is set from
+        // total_deposit_stxo_value (0) + each value, overwriting each time, so
+        // it ends as a single withdrawal value (10 or 20). wealth = 1000 - that
+        // = 990 or 980, i.e. != 970.
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            let dep = OutPoint::Deposit(bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_raw_hash(
+                    bitcoin::hashes::Hash::all_zeros(),
+                ),
+                vout: 0,
+            });
+            state
+                .utxos
+                .put(
+                    &mut rwtxn,
+                    &(&dep).into(),
+                    &Output {
+                        address: Address([0u8; 20]),
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(1000),
+                        ),
+                    },
+                )
+                .unwrap();
+            let op1 = OutPoint::Regular {
+                txid: Txid::from([0x01; 32]),
+                vout: 0,
+            };
+            let op2 = OutPoint::Regular {
+                txid: Txid::from([0x02; 32]),
+                vout: 0,
+            };
+            state
+                .stxos
+                .put(&mut rwtxn, &(&op1).into(), &withdrawal_stxo(10))
+                .unwrap();
+            state
+                .stxos
+                .put(&mut rwtxn, &(&op2).into(), &withdrawal_stxo(20))
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let rotxn = env.read_txn().unwrap();
+        let wealth = state.sidechain_wealth(&rotxn).unwrap();
+        let correct = bitcoin::Amount::from_sat(970);
+        assert_ne!(
+            wealth, correct,
+            "buggy accounting must not equal the correct 970 sats"
+        );
+        // The buggy result equals 1000 - one_of_the_withdrawals.
+        assert!(
+            wealth == bitcoin::Amount::from_sat(990)
+                || wealth == bitcoin::Amount::from_sat(980),
+            "buggy wealth should reflect only a single withdrawal STXO, got {wealth}"
+        );
+        println!(
+            "proven: sidechain_wealth reported {wealth} instead of correct 970 sats; withdrawal STXOs (10+20) were not summed because the branch reads total_deposit_stxo_value"
+        );
+    }
+}
+
+/// delete_swap_unchecked's found-swap branch never unlocks the swap's
+/// locked outputs, so deleting a Pending swap orphans its lock entry. The
+/// output stays in locked_swap_outputs pointing at a now-deleted swap.
+#[cfg(test)]
+mod bug_delete_swap_orphan_lock {
+    use super::test_env::fresh_env;
+    use super::*;
+    use crate::types::{
+        OutPoint, ParentChainType, Swap, SwapDirection, SwapId, SwapState,
+        SwapTxId, Txid,
+    };
+
+    #[test]
+    fn deleting_pending_swap_orphans_its_lock() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let swap_id = SwapId([0x44; 32]);
+        let swap = Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::Hash32([0u8; 32]),
+            Some(1),
+            None,
+            bitcoin::Amount::from_sat(1_000_000),
+            Some("bcrt1qx".to_string()),
+            Some(bitcoin::Amount::from_sat(500_000)),
+            0,
+            None,
+            None,
+        );
+        assert_eq!(swap.state, SwapState::Pending);
+
+        let locked_outpoint = OutPoint::Regular {
+            txid: Txid::from([0x66; 32]),
+            vout: 0,
+        };
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state.save_swap(&mut rwtxn, &swap).unwrap();
+            state
+                .lock_output_to_swap(&mut rwtxn, &locked_outpoint, &swap_id)
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        // Sanity: lock is present before delete.
+        {
+            let rotxn = env.read_txn().unwrap();
+            assert_eq!(
+                state
+                    .is_output_locked_to_swap(&rotxn, &locked_outpoint)
+                    .unwrap(),
+                Some(swap_id)
+            );
+        }
+
+        // Delete the pending swap.
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state.delete_swap_unchecked(&mut rwtxn, &swap_id).unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let rotxn = env.read_txn().unwrap();
+        // Swap record is gone.
+        assert!(state.get_swap(&rotxn, &swap_id).unwrap().is_none());
+        // But the lock is orphaned: still present, pointing at the deleted swap.
+        let still_locked = state
+            .is_output_locked_to_swap(&rotxn, &locked_outpoint)
+            .unwrap();
+        assert_eq!(
+            still_locked,
+            Some(swap_id),
+            "delete_swap_unchecked should have left the output locked (orphaned)"
+        );
+        println!(
+            "proven: after delete_swap_unchecked on a Pending swap, its output is still in locked_swap_outputs pointing at the deleted swap {swap_id}; validate_no_locked_outputs would reject any later regular spend"
+        );
+    }
+}
+
+/// reconstruct_swaps_from_blockchain fills each historical tx with
+/// fill_transaction(), which reads only the live `utxos` table. A historical
+/// SwapCreate already spent its inputs during block connection, so those inputs
+/// are now in `stxos`, not `utxos`. Reconstruction therefore fails with NoUtxo
+/// for ordinary swaps and cannot rebuild them.
+#[cfg(test)]
+mod bug_swap_reconstruction_spent_input {
+    use super::test_env::fresh_env;
+    use super::*;
+    use crate::types::{
+        Address, InPoint, OutPoint, Output, OutputContent, ParentChainType,
+        SpentOutput, Swap, SwapDirection, SwapId, SwapTxId, Transaction, Txid,
+    };
+
+    #[test]
+    fn fill_transaction_fails_on_already_spent_historical_input() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        // A historical SwapCreate spent this input at connection time, so it
+        // now lives in `stxos`, not `utxos` (the live UTXO set).
+        let spent_input = OutPoint::Regular {
+            txid: Txid::from([0x70; 32]),
+            vout: 0,
+        };
+        let creator = Address([0x15; 20]);
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state
+                .stxos
+                .put(
+                    &mut rwtxn,
+                    &(&spent_input).into(),
+                    &SpentOutput {
+                        output: Output {
+                            address: creator,
+                            content: OutputContent::Value(
+                                bitcoin::Amount::from_sat(1_000_000),
+                            ),
+                        },
+                        inpoint: InPoint::Regular {
+                            txid: Txid::from([0x71; 32]),
+                            vin: 0,
+                        },
+                    },
+                )
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        // The historical SwapCreate transaction that consumed `spent_input`.
+        let swap_id = SwapId([0x15; 32]);
+        let historical_swap_create = Transaction {
+            inputs: vec![(spent_input, crate::types::Hash::default())],
+            proof: Default::default(),
+            outputs: vec![Output {
+                address: creator,
+                content: OutputContent::SwapPending {
+                    value: bitcoin::Amount::from_sat(1_000_000),
+                    swap_id: swap_id.0,
+                },
+            }],
+            data: TxData::SwapCreate {
+                swap_id: swap_id.0,
+                parent_chain: ParentChainType::Regtest,
+                l1_txid_bytes: vec![0u8; 32],
+                required_confirmations: 1,
+                l2_recipient: None,
+                l2_amount: 1_000_000,
+                l1_recipient_address: Some("bcrt1qx".to_string()),
+                l1_amount: Some(500_000),
+            },
+        };
+
+        // This is exactly what reconstruct_swaps_from_blockchain does for each
+        // historical tx (mod.rs: `let filled = self.fill_transaction(...)?;`).
+        let rotxn = env.read_txn().unwrap();
+        let result =
+            state.fill_transaction(&rotxn, &historical_swap_create);
+
+        match result {
+            Err(Error::NoUtxo { outpoint }) => {
+                assert_eq!(outpoint, spent_input);
+            }
+            other => panic!(
+                "expected NoUtxo for an already-spent historical input, got {other:?}"
+            ),
+        }
+
+        // Bonus: the reconstruction path also drops expiration metadata,
+        // building swaps with expires_at_height = None (mod.rs line ~1829),
+        // so a reconstructed pending swap can never enter the expiry/unlock path.
+        let reconstructed = Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::from_bytes(&[0u8; 32]),
+            Some(1),
+            None,
+            bitcoin::Amount::from_sat(1_000_000),
+            Some("bcrt1qx".to_string()),
+            Some(bitcoin::Amount::from_sat(500_000)),
+            5,
+            None, // exactly what reconstruction passes
+            Some(creator),
+        );
+        assert_eq!(
+            reconstructed.expires_at_height, None,
+            "reconstructed swap should have no expiration (expiry worker never runs)"
+        );
+
+        println!(
+            "proven: fill_transaction (called by reconstruct_swaps_from_blockchain for every historical tx) returns NoUtxo for an ordinary SwapCreate whose input is already spent (now in stxos), so reconstruction cannot rebuild it; reconstructed swaps also get expires_at_height=None"
+        );
+    }
+}

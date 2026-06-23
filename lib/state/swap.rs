@@ -305,3 +305,94 @@ pub fn validate_no_locked_outputs(
 
     Ok(())
 }
+
+/// For an open swap with no stored l2_claimer_address (e.g. an
+/// auto-detected L1 payment that never recorded the payer's L2 address),
+/// validate_swap_claim accepts whatever l2_claimer_address the claim supplies.
+/// A front-runner can therefore claim to their own L2 address.
+#[cfg(test)]
+mod bug_fake_l1_swap_claim {
+    use super::*;
+    use crate::state::test_env::fresh_env;
+    use crate::types::{
+        Address, Output, OutputContent, OutPoint, ParentChainType, Swap,
+        SwapDirection, SwapState, Transaction, Txid,
+    };
+
+    #[test]
+    fn open_swap_accepts_caller_supplied_l2_claimer() {
+        let env = fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let swap_id = SwapId([0x33; 32]);
+        // Open swap (l2_recipient = None), filled with a (real or fake) L1 txid,
+        // but no stored l2_claimer_address. Force state ReadyToClaim.
+        let mut swap = Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::Hash32([0xAB; 32]), // non-zero -> "L1 tx detected"
+            Some(1),
+            None, // open swap
+            bitcoin::Amount::from_sat(1_000_000),
+            Some("bcrt1qrecipient".to_string()),
+            Some(bitcoin::Amount::from_sat(500_000)),
+            0,
+            None,
+            None,
+        );
+        swap.state = SwapState::ReadyToClaim;
+        assert!(swap.l2_claimer_address.is_none());
+
+        let locked_outpoint = OutPoint::Regular {
+            txid: Txid::from([0x55; 32]),
+            vout: 0,
+        };
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state.save_swap(&mut rwtxn, &swap).unwrap();
+            state
+                .lock_output_to_swap(&mut rwtxn, &locked_outpoint, &swap_id)
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        // Attacker (Mallory) submits a claim naming HER OWN L2 address.
+        let mallory = Address([0xEE; 20]);
+        let tx = Transaction {
+            inputs: vec![(locked_outpoint, crate::types::Hash::default())],
+            proof: Default::default(),
+            outputs: vec![Output {
+                address: mallory,
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    1_000_000,
+                )),
+            }],
+            data: TxData::SwapClaim {
+                swap_id: swap_id.0,
+                l2_claimer_address: Some(mallory),
+                proof_data: None,
+            },
+        };
+        let filled = FilledTransaction {
+            transaction: tx.clone(),
+            spent_utxos: vec![Output {
+                address: Address([0x01; 20]),
+                content: OutputContent::SwapPending {
+                    value: bitcoin::Amount::from_sat(1_000_000),
+                    swap_id: swap_id.0,
+                },
+            }],
+        };
+
+        let rotxn = env.read_txn().unwrap();
+        let result = validate_swap_claim(&state, &rotxn, &tx, &filled);
+        assert!(
+            result.is_ok(),
+            "open swap with no stored claimer must accept a caller-supplied l2_claimer_address, got {result:?}"
+        );
+        println!(
+            "proven: validate_swap_claim accepted an open-swap claim paying an arbitrary caller-supplied L2 address (attacker) with no proof the claimer was the L1 payer"
+        );
+    }
+}

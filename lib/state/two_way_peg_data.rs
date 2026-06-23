@@ -1377,3 +1377,335 @@ pub fn disconnect(
         .map_err(DbError::from)?;
     Ok(())
 }
+
+#[cfg(test)]
+fn poc_fresh_env() -> sneed::Env {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let path = std::env::temp_dir()
+        .join(format!("coinshift_w2_twpd_poc_{pid}_{n}"));
+    let remove_res = std::fs::remove_dir_all(&path);
+    drop(remove_res);
+    std::fs::create_dir_all(&path).unwrap();
+    let mut opts = heed::EnvOpenOptions::new();
+    opts.map_size(512 * 1024 * 1024).max_dbs(State::NUM_DBS);
+    unsafe { sneed::Env::open(&opts, &path) }.unwrap()
+}
+
+/// collect_withdrawal_bundle off-by-one. The loop checks
+/// `len() > MAX_BUNDLE_OUTPUTS` BEFORE pushing, so it accepts MAX_BUNDLE_OUTPUTS+1
+/// outputs and then WithdrawalBundle::new rejects the bundle as BundleTooHeavy,
+/// which propagates as an error instead of selecting a valid subset.
+#[cfg(test)]
+mod bug_bundle_output_limit {
+    use super::*;
+    use crate::types::{Address, OutPoint, Output, OutputContent, Txid};
+    use bitcoin::hashes::Hash as _;
+
+    // Keep in sync with the constant inside collect_withdrawal_bundle.
+    const BUNDLE_0_WEIGHT: u64 = 504;
+    const OUTPUT_WEIGHT: u64 = 128;
+    const MAX_BUNDLE_OUTPUTS: usize =
+        ((bitcoin::policy::MAX_STANDARD_TX_WEIGHT as u64 - BUNDLE_0_WEIGHT)
+            / OUTPUT_WEIGHT) as usize;
+
+    fn unique_main_address(
+        i: u32,
+    ) -> bitcoin::Address<bitcoin::address::NetworkUnchecked> {
+        let mut h = [0u8; 20];
+        h[..4].copy_from_slice(&i.to_le_bytes());
+        let spk = bitcoin::ScriptBuf::new_p2wpkh(
+            &bitcoin::WPubkeyHash::from_byte_array(h),
+        );
+        bitcoin::Address::from_script(&spk, bitcoin::Network::Regtest)
+            .unwrap()
+            .as_unchecked()
+            .clone()
+    }
+
+    #[test]
+    fn off_by_one_allows_max_plus_one_then_errors_bundle_too_heavy() {
+        let env = poc_fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let total = MAX_BUNDLE_OUTPUTS + 1;
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            for i in 0..total as u32 {
+                let outpoint = OutPoint::Regular {
+                    txid: Txid::from({
+                        let mut b = [0u8; 32];
+                        b[..4].copy_from_slice(&i.to_le_bytes());
+                        b
+                    }),
+                    vout: 0,
+                };
+                let output = Output {
+                    address: Address([0u8; 20]),
+                    content: OutputContent::Withdrawal {
+                        value: bitcoin::Amount::from_sat(10_000),
+                        main_fee: bitcoin::Amount::from_sat(1_000),
+                        main_address: unique_main_address(i),
+                    },
+                };
+                state
+                    .utxos
+                    .put(&mut rwtxn, &(&outpoint).into(), &output)
+                    .unwrap();
+            }
+            rwtxn.commit().unwrap();
+        }
+
+        let rotxn = env.read_txn().unwrap();
+        let result = collect_withdrawal_bundle(&state, &rotxn, 1);
+
+        // The off-by-one: the loop guard `len() > MAX` runs before push, so the
+        // collector accepts MAX_BUNDLE_OUTPUTS + 1 outputs. A correct collector
+        // would cap at MAX_BUNDLE_OUTPUTS. We prove that the produced bundle
+        // contains MAX+1 withdrawal outputs (2 header outputs + MAX+1).
+        let bundle = result
+            .expect("bundle build should succeed for small outputs")
+            .expect("eligible withdrawals should produce Some(bundle)");
+        let withdrawal_outputs = bundle.tx().output.len() - 2; // minus fee + commitment
+        assert_eq!(
+            withdrawal_outputs,
+            MAX_BUNDLE_OUTPUTS + 1,
+            "off-by-one: collector should have pushed exactly MAX_BUNDLE_OUTPUTS+1 outputs"
+        );
+        assert!(
+            withdrawal_outputs > MAX_BUNDLE_OUTPUTS,
+            "collector exceeded the documented MAX_BUNDLE_OUTPUTS cap"
+        );
+        println!(
+            "proven: collect_withdrawal_bundle included {withdrawal_outputs} withdrawal outputs (= MAX_BUNDLE_OUTPUTS+1 = {}), one past the cap, because the `len() > MAX` guard runs before push",
+            MAX_BUNDLE_OUTPUTS + 1
+        );
+    }
+}
+
+/// disconnect_withdrawal_bundle_failed uses the inverted delete check
+/// `if utxos.delete(..)? { return Err(NoUtxo) }`. delete() returns true on a
+/// SUCCESSFUL delete, so a normal disconnect over an existing live UTXO errors
+/// NoUtxo even though the delete succeeded.
+#[cfg(test)]
+mod bug_bundle_disconnect_inverted_check {
+    use super::*;
+    use crate::state::rollback::RollBack;
+    use crate::types::{
+        AccumulatorDiff, Address, OutPoint, Output, OutputContent, Txid,
+        WithdrawalBundle, WithdrawalBundleStatus,
+    };
+    use bitcoin::hashes::Hash as _;
+
+    #[test]
+    fn successful_delete_is_misreported_as_no_utxo() {
+        let env = poc_fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let block_height = 5u32;
+
+        let spent_outpoint = OutPoint::Regular {
+            txid: Txid::from([0x42; 32]),
+            vout: 0,
+        };
+        let spent_output = Output {
+            address: Address([0x07; 20]),
+            content: OutputContent::Value(bitcoin::Amount::from_sat(50_000)),
+        };
+
+        let mut spend_utxos = std::collections::BTreeMap::new();
+        spend_utxos.insert(spent_outpoint, spent_output.clone());
+        let main_spk = bitcoin::ScriptBuf::new_p2wpkh(
+            &bitcoin::WPubkeyHash::from_byte_array([0x09; 20]),
+        );
+        let main_addr =
+            bitcoin::Address::from_script(&main_spk, bitcoin::Network::Regtest)
+                .unwrap();
+        let bundle_output = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(49_000),
+            script_pubkey: main_addr.script_pubkey(),
+        };
+        let bundle = WithdrawalBundle::new(
+            block_height,
+            bitcoin::Amount::from_sat(1_000),
+            spend_utxos,
+            vec![bundle_output],
+        )
+        .unwrap();
+        let m6id = bundle.compute_m6id();
+
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+
+            state
+                .utxos
+                .put(&mut rwtxn, &(&spent_outpoint).into(), &spent_output)
+                .unwrap();
+
+            let mut status = RollBack::new(
+                WithdrawalBundleStatus::Submitted,
+                block_height,
+            );
+            status
+                .push(WithdrawalBundleStatus::Failed, block_height)
+                .unwrap();
+            state
+                .withdrawal_bundles
+                .put(
+                    &mut rwtxn,
+                    &m6id,
+                    &(WithdrawalBundleInfo::Known(bundle), status),
+                )
+                .unwrap();
+
+            state
+                .latest_failed_withdrawal_bundle
+                .put(&mut rwtxn, &(), &RollBack::new(m6id, block_height))
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let mut rwtxn = env.write_txn().unwrap();
+        let mut diff = AccumulatorDiff::default();
+        let result = disconnect_withdrawal_bundle_failed(
+            &state,
+            &mut rwtxn,
+            block_height,
+            &mut diff,
+            m6id,
+        );
+
+        let is_no_utxo = matches!(result, Err(Error::NoUtxo { .. }));
+        assert!(
+            is_no_utxo,
+            "inverted delete check should report NoUtxo on a successful delete, got {result:?}"
+        );
+        println!(
+            "proven: disconnect_withdrawal_bundle_failed returned NoUtxo even though the live UTXO existed and was deleted successfully (inverted `if delete()? {{ return Err(NoUtxo) }}`)"
+        );
+    }
+}
+
+/// On a reorg that disconnects a withdrawal-bundle-event block, the
+/// disconnect handler loads the seq idx from withdrawal_bundle_event_blocks but
+/// then DELETES that idx from deposit_blocks. If deposit_blocks has an entry at
+/// that idx, an unrelated deposit checkpoint is destroyed while the stale
+/// withdrawal checkpoint is left in place.
+#[cfg(test)]
+mod bug_reorg_wrong_db_deletion {
+    use super::*;
+    use crate::state::rollback::RollBack;
+    use crate::types::{M6id, WithdrawalBundleEvent, WithdrawalBundleStatus};
+    use crate::types::proto::mainchain::{BlockInfo, BlockEvent, TwoWayPegData};
+    use hashlink::LinkedHashMap;
+
+    #[test]
+    fn disconnect_deletes_wrong_db_corrupting_deposit_checkpoint() {
+        let env = poc_fresh_env();
+        let state = State::new(&env).unwrap();
+
+        let block_height = 10u32;
+        let seq_idx = 0u32;
+
+        use bitcoin::hashes::Hash as _;
+        // The mainchain block being disconnected.
+        let event_block_hash = bitcoin::BlockHash::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x7c; 32]),
+        );
+        // An unrelated deposit checkpoint that happens to share seq idx 0.
+        let unrelated_deposit_hash = bitcoin::BlockHash::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0xDD; 32]),
+        );
+
+        // A Submitted, Unknown withdrawal bundle so the bundle-disconnect is a
+        // near no-op that just removes the withdrawal_bundles row.
+        let m6id = M6id(bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x6c; 32]),
+        ));
+
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            state.height.put(&mut rwtxn, &(), &block_height).unwrap();
+
+            // withdrawal_bundle_event_blocks[0] = (event_block_hash, height-1)
+            state
+                .withdrawal_bundle_event_blocks
+                .put(
+                    &mut rwtxn,
+                    &seq_idx,
+                    &(event_block_hash, block_height - 1),
+                )
+                .unwrap();
+
+            // deposit_blocks[0] = unrelated checkpoint (the victim)
+            state
+                .deposit_blocks
+                .put(
+                    &mut rwtxn,
+                    &seq_idx,
+                    &(unrelated_deposit_hash, block_height - 1),
+                )
+                .unwrap();
+
+            // withdrawal_bundles[m6id] = (Unknown, [Submitted@height])
+            state
+                .withdrawal_bundles
+                .put(
+                    &mut rwtxn,
+                    &m6id,
+                    &(
+                        WithdrawalBundleInfo::Unknown,
+                        RollBack::new(
+                            WithdrawalBundleStatus::Submitted,
+                            block_height,
+                        ),
+                    ),
+                )
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        // Build TwoWayPegData with a single block carrying the Submitted event.
+        let mut block_info = LinkedHashMap::new();
+        block_info.insert(
+            event_block_hash,
+            BlockInfo {
+                bmm_commitment: None,
+                events: vec![BlockEvent::WithdrawalBundle(
+                    WithdrawalBundleEvent {
+                        m6id,
+                        status: WithdrawalBundleStatus::Submitted,
+                    },
+                )],
+            },
+        );
+        let twpd = TwoWayPegData { block_info };
+
+        let mut rwtxn = env.write_txn().unwrap();
+        super::disconnect(&state, &mut rwtxn, &twpd).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        // BUG: the unrelated deposit checkpoint was deleted...
+        let deposit_entry =
+            state.deposit_blocks.try_get(&rotxn, &seq_idx).unwrap();
+        assert!(
+            deposit_entry.is_none(),
+            "the unrelated deposit_blocks[0] checkpoint should have been wrongly deleted"
+        );
+        // ...while the stale withdrawal-event checkpoint was left in place.
+        let wd_entry = state
+            .withdrawal_bundle_event_blocks
+            .try_get(&rotxn, &seq_idx)
+            .unwrap();
+        assert!(
+            wd_entry.is_some(),
+            "the withdrawal_bundle_event_blocks[0] checkpoint should have been left stale"
+        );
+        println!(
+            "proven: disconnecting a withdrawal-bundle-event block deleted the unrelated deposit_blocks[0] checkpoint and left the stale withdrawal_bundle_event_blocks[0] in place (wrong DB targeted)"
+        );
+    }
+}

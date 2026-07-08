@@ -1363,3 +1363,172 @@ pub fn disconnect(
         .map_err(DbError::from)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::Hash as _;
+    use sneed::Env;
+
+    use super::*;
+    use crate::types::proto::mainchain::BlockInfo;
+
+    fn test_state() -> (temp_dir::TempDir, Env, State) {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(10 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env).unwrap();
+        (dir, env, state)
+    }
+
+    fn set_height(env: &Env, state: &State, height: u32) {
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .tip
+            .put(&mut rwtxn, &(), &BlockHash([height as u8; 32]))
+            .unwrap();
+        state.height.put(&mut rwtxn, &(), &height).unwrap();
+        rwtxn.commit().unwrap();
+    }
+
+    fn withdrawal_event_data(
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+    ) -> TwoWayPegData {
+        let mut data = TwoWayPegData::default();
+        data.block_info.insert(
+            event_block_hash,
+            BlockInfo {
+                bmm_commitment: None,
+                events: vec![BlockEvent::WithdrawalBundle(
+                    WithdrawalBundleEvent {
+                        m6id,
+                        status: WithdrawalBundleStatus::Submitted,
+                    },
+                )],
+            },
+        );
+        data
+    }
+
+    #[test]
+    fn disconnect_connected_withdrawal_event_panics_on_height_mismatch() {
+        let (_dir, env, state) = test_state();
+        set_height(&env, &state, 1);
+        let m6id = M6id(bitcoin::Txid::from_byte_array([6; 32]));
+        let event_block_hash = bitcoin::BlockHash::from_byte_array([7; 32]);
+        let data = withdrawal_event_data(event_block_hash, m6id);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        connect(&state, &mut rwtxn, &data, None, None).unwrap();
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                disconnect(&state, &mut rwtxn, &data)
+            }));
+        assert!(
+            result.is_err(),
+            "disconnecting the event just connected at the current height should not panic"
+        );
+    }
+
+    #[test]
+    fn disconnect_withdrawal_event_deletes_deposit_index_instead_of_withdrawal_index()
+     {
+        let (_dir, env, state) = test_state();
+        set_height(&env, &state, 1);
+        let m6id = M6id(bitcoin::Txid::from_byte_array([6; 32]));
+        let event_block_hash = bitcoin::BlockHash::from_byte_array([7; 32]);
+        let data = withdrawal_event_data(event_block_hash, m6id);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .withdrawal_bundles
+            .put(
+                &mut rwtxn,
+                &m6id,
+                &(
+                    WithdrawalBundleInfo::Unknown,
+                    RollBack::new(WithdrawalBundleStatus::Submitted, 1),
+                ),
+            )
+            .unwrap();
+        state
+            .withdrawal_bundle_event_blocks
+            .put(&mut rwtxn, &0, &(event_block_hash, 0))
+            .unwrap();
+
+        let result = disconnect(&state, &mut rwtxn, &data);
+        assert!(
+            matches!(result, Err(Error::NoWithdrawalBundleEventBlock)),
+            "disconnect should delete withdrawal_bundle_event_blocks, not fail because deposit_blocks is empty: {result:?}"
+        );
+        assert!(
+            state
+                .withdrawal_bundle_event_blocks
+                .try_get(&rwtxn, &0)
+                .unwrap()
+                .is_some(),
+            "the withdrawal event index was left behind"
+        );
+    }
+
+    #[test]
+    fn disconnect_failed_known_withdrawal_bundle_rejects_successful_utxo_delete()
+     {
+        let (_dir, env, state) = test_state();
+        set_height(&env, &state, 1);
+        let outpoint = OutPoint::Regular {
+            txid: crate::types::Txid([8; 32]),
+            vout: 0,
+        };
+        let output = Output {
+            address: crate::types::Address([9; 20]),
+            content: OutputContent::Value(bitcoin::Amount::from_sat(50_000)),
+        };
+        let bundle = WithdrawalBundle::new(
+            1,
+            bitcoin::Amount::ZERO,
+            std::collections::BTreeMap::from([(outpoint, output.clone())]),
+            vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        )
+        .unwrap();
+        let m6id = bundle.compute_m6id();
+        let mut statuses = RollBack::new(WithdrawalBundleStatus::Submitted, 0);
+        statuses.push(WithdrawalBundleStatus::Failed, 1).unwrap();
+        let event_block_hash = bitcoin::BlockHash::from_byte_array([10; 32]);
+        let mut data = withdrawal_event_data(event_block_hash, m6id);
+        data.block_info.get_mut(&event_block_hash).unwrap().events =
+            vec![BlockEvent::WithdrawalBundle(WithdrawalBundleEvent {
+                m6id,
+                status: WithdrawalBundleStatus::Failed,
+            })];
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .utxos
+            .put(&mut rwtxn, &OutPointKey::from(&outpoint), &output)
+            .unwrap();
+        state
+            .withdrawal_bundles
+            .put(
+                &mut rwtxn,
+                &m6id,
+                &(WithdrawalBundleInfo::Known(bundle), statuses),
+            )
+            .unwrap();
+        state
+            .latest_failed_withdrawal_bundle
+            .put(&mut rwtxn, &(), &RollBack::new(m6id, 1))
+            .unwrap();
+
+        let result = disconnect(&state, &mut rwtxn, &data);
+        assert!(
+            matches!(result, Err(Error::NoUtxo { outpoint: err }) if err == outpoint),
+            "disconnect should accept deleting the restored UTXO, got {result:?}"
+        );
+    }
+}

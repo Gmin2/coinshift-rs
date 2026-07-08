@@ -889,3 +889,692 @@ pub fn disconnect_tip(
         .map_err(DbError::from)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::Hash as _;
+    use sneed::Env;
+
+    use super::*;
+    use crate::{
+        authorization::{SigningKey, authorize, get_address},
+        types::{
+            Accumulator, Address, Output, OutputContent, ParentChainType,
+            SwapDirection, SwapTxId, Transaction, Txid, hash,
+        },
+    };
+
+    fn sat(value: u64) -> bitcoin::Amount {
+        bitcoin::Amount::from_sat(value)
+    }
+
+    fn test_state() -> (temp_dir::TempDir, Env, State) {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(10 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env).unwrap();
+        (dir, env, state)
+    }
+
+    fn seed_utxo_set(env: &Env, state: &State, utxos: &[PointedOutput]) {
+        let mut accumulator = Accumulator::default();
+        let mut accumulator_diff = AccumulatorDiff::default();
+        let mut rwtxn = env.write_txn().unwrap();
+        for pointed_output in utxos {
+            state
+                .utxos
+                .put(
+                    &mut rwtxn,
+                    &OutPointKey::from(&pointed_output.outpoint),
+                    &pointed_output.output,
+                )
+                .unwrap();
+            accumulator_diff.insert(pointed_output.into());
+        }
+        accumulator.apply_diff(accumulator_diff).unwrap();
+        state
+            .utreexo_accumulator
+            .put(&mut rwtxn, &(), &accumulator)
+            .unwrap();
+        rwtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn apply_block_accepts_outpoint_hash_mismatch_and_corrupts_accumulator() {
+        let (_dir, env, state) = test_state();
+        let signing_key_a = SigningKey::from_bytes(&[1u8; 32]);
+        let address_a = get_address(&signing_key_a.verifying_key());
+
+        let outpoint_a = OutPoint::Regular {
+            txid: Txid([1u8; 32]),
+            vout: 0,
+        };
+        let output_a = Output {
+            address: address_a,
+            content: OutputContent::Value(sat(10_000)),
+        };
+        let pointed_a = PointedOutput {
+            outpoint: outpoint_a,
+            output: output_a.clone(),
+        };
+
+        let outpoint_b = OutPoint::Regular {
+            txid: Txid([2u8; 32]),
+            vout: 0,
+        };
+        let output_b = Output {
+            address: Address([2u8; 20]),
+            content: OutputContent::Value(sat(20_000)),
+        };
+        let pointed_b = PointedOutput {
+            outpoint: outpoint_b,
+            output: output_b.clone(),
+        };
+        seed_utxo_set(&env, &state, &[pointed_a.clone(), pointed_b.clone()]);
+
+        let rotxn = env.read_txn().unwrap();
+        let proof_for_b = state
+            .get_utreexo_proof(&rotxn, std::iter::once(&pointed_b))
+            .unwrap();
+        let utxo_hash_b = hash(&pointed_b);
+        drop(rotxn);
+
+        let transaction = Transaction {
+            inputs: vec![(outpoint_a, utxo_hash_b)],
+            proof: proof_for_b,
+            outputs: vec![Output {
+                address: address_a,
+                content: OutputContent::Value(sat(9_000)),
+            }],
+            data: TxData::Regular,
+        };
+        let authorized_transaction =
+            authorize(&[(address_a, &signing_key_a)], transaction).unwrap();
+        let body = Body::new(vec![authorized_transaction], vec![]);
+
+        let filled_transaction = FilledTransaction {
+            transaction: body.transactions[0].clone(),
+            spent_utxos: vec![output_a.clone()],
+        };
+        let rotxn = env.read_txn().unwrap();
+        let mut header_accumulator = state.get_accumulator(&rotxn).unwrap();
+        let merkle_root = Body::modify_memforest(
+            &body.coinbase,
+            &[filled_transaction],
+            &mut header_accumulator.0,
+        )
+        .unwrap();
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: header_accumulator.get_roots(),
+        };
+        drop(rotxn);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state.apply_block(&mut rwtxn, &header, &body).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            state
+                .utxos
+                .try_get(&rotxn, &OutPointKey::from(&outpoint_a))
+                .unwrap()
+                .is_none(),
+            "the DB spent outpoint A"
+        );
+        assert_eq!(
+            state
+                .utxos
+                .try_get(&rotxn, &OutPointKey::from(&outpoint_b))
+                .unwrap(),
+            Some(output_b),
+            "the DB still exposes outpoint B as unspent"
+        );
+
+        let accumulator = state.get_accumulator(&rotxn).unwrap();
+        assert!(
+            accumulator
+                .prove(&[BitcoinNodeHash::from(&pointed_a)])
+                .is_ok(),
+            "outpoint A remains in the accumulator"
+        );
+        assert!(
+            accumulator
+                .prove(&[BitcoinNodeHash::from(&pointed_b)])
+                .is_err(),
+            "outpoint B was removed from the accumulator"
+        );
+    }
+
+    #[test]
+    fn mempool_validation_accepts_too_few_authorizations_but_block_validation_rejects()
+     {
+        let (_dir, env, state) = test_state();
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let address = get_address(&signing_key.verifying_key());
+
+        let outpoint_a = OutPoint::Regular {
+            txid: Txid([3u8; 32]),
+            vout: 0,
+        };
+        let output_a = Output {
+            address,
+            content: OutputContent::Value(sat(10_000)),
+        };
+        let pointed_a = PointedOutput {
+            outpoint: outpoint_a,
+            output: output_a,
+        };
+        let outpoint_b = OutPoint::Regular {
+            txid: Txid([4u8; 32]),
+            vout: 0,
+        };
+        let output_b = Output {
+            address,
+            content: OutputContent::Value(sat(10_000)),
+        };
+        let pointed_b = PointedOutput {
+            outpoint: outpoint_b,
+            output: output_b,
+        };
+        seed_utxo_set(&env, &state, &[pointed_a.clone(), pointed_b.clone()]);
+
+        let rotxn = env.read_txn().unwrap();
+        let proof = state
+            .get_utreexo_proof(&rotxn, [&pointed_a, &pointed_b])
+            .unwrap();
+        drop(rotxn);
+
+        let transaction = Transaction {
+            inputs: vec![
+                (outpoint_a, hash(&pointed_a)),
+                (outpoint_b, hash(&pointed_b)),
+            ],
+            proof,
+            outputs: vec![Output {
+                address,
+                content: OutputContent::Value(sat(19_000)),
+            }],
+            data: TxData::Regular,
+        };
+        let authorized_transaction =
+            authorize(&[(address, &signing_key)], transaction).unwrap();
+
+        assert_eq!(authorized_transaction.transaction.inputs.len(), 2);
+        assert_eq!(authorized_transaction.authorizations.len(), 1);
+
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            state
+                .validate_transaction(&rotxn, &authorized_transaction)
+                .is_ok(),
+            "transaction-level validation accepts one signature for two inputs"
+        );
+        drop(rotxn);
+
+        let body = Body::new(vec![authorized_transaction], vec![]);
+        assert!(
+            Authorization::verify_body(&body).is_err(),
+            "block-level authorization validation rejects the same transaction"
+        );
+    }
+
+    #[test]
+    fn swap_claim_can_spend_unlocked_swap_pending_input_without_owner_signature()
+     {
+        let (_dir, env, state) = test_state();
+        let attacker_key = SigningKey::from_bytes(&[5u8; 32]);
+        let attacker_address = get_address(&attacker_key.verifying_key());
+        let victim_address = Address([6u8; 20]);
+        let swap_id = SwapId([7u8; 32]);
+
+        let locked_outpoint = OutPoint::Regular {
+            txid: Txid([8u8; 32]),
+            vout: 0,
+        };
+        let locked_output = Output {
+            address: attacker_address,
+            content: OutputContent::SwapPending {
+                value: sat(10_000),
+                swap_id: swap_id.0,
+            },
+        };
+        let locked_pointed = PointedOutput {
+            outpoint: locked_outpoint,
+            output: locked_output.clone(),
+        };
+
+        let victim_outpoint = OutPoint::Regular {
+            txid: Txid([9u8; 32]),
+            vout: 0,
+        };
+        let victim_output = Output {
+            address: victim_address,
+            content: OutputContent::SwapPending {
+                value: sat(10_000),
+                swap_id: [9u8; 32],
+            },
+        };
+        let victim_pointed = PointedOutput {
+            outpoint: victim_outpoint,
+            output: victim_output.clone(),
+        };
+
+        seed_utxo_set(
+            &env,
+            &state,
+            &[locked_pointed.clone(), victim_pointed.clone()],
+        );
+        let mut rwtxn = env.write_txn().unwrap();
+        let mut swap = Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::from_bytes(&[1u8; 32]),
+            Some(1),
+            Some(attacker_address),
+            sat(5_000),
+            "bcrt1qattacker".to_owned(),
+            sat(5_000),
+            0,
+            Some(50),
+            Some(attacker_address),
+        );
+        swap.state = SwapState::ReadyToClaim;
+        state.save_swap(&mut rwtxn, &swap).unwrap();
+        state
+            .lock_output_to_swap(&mut rwtxn, &locked_outpoint, &swap_id)
+            .unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let proof = state
+            .get_utreexo_proof(&rotxn, [&locked_pointed, &victim_pointed])
+            .unwrap();
+        drop(rotxn);
+
+        let transaction = Transaction {
+            inputs: vec![
+                (locked_outpoint, hash(&locked_pointed)),
+                (victim_outpoint, hash(&victim_pointed)),
+            ],
+            proof,
+            outputs: vec![Output {
+                address: attacker_address,
+                content: OutputContent::Value(sat(19_000)),
+            }],
+            data: TxData::SwapClaim {
+                swap_id: swap_id.0,
+                l2_claimer_address: None,
+                proof_data: None,
+            },
+        };
+        let authorized_transaction = authorize(
+            &[
+                (attacker_address, &attacker_key),
+                (attacker_address, &attacker_key),
+            ],
+            transaction,
+        )
+        .unwrap();
+        let body = Body::new(vec![authorized_transaction], vec![]);
+
+        let filled_transaction = FilledTransaction {
+            transaction: body.transactions[0].clone(),
+            spent_utxos: vec![locked_output, victim_output.clone()],
+        };
+        let rotxn = env.read_txn().unwrap();
+        let mut header_accumulator = state.get_accumulator(&rotxn).unwrap();
+        let merkle_root = Body::modify_memforest(
+            &body.coinbase,
+            &[filled_transaction],
+            &mut header_accumulator.0,
+        )
+        .unwrap();
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: header_accumulator.get_roots(),
+        };
+        drop(rotxn);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state.apply_block(&mut rwtxn, &header, &body).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            state
+                .utxos
+                .try_get(&rotxn, &OutPointKey::from(&victim_outpoint))
+                .unwrap()
+                .is_none(),
+            "victim's unlocked SwapPending output was spent"
+        );
+        assert_eq!(
+            state
+                .stxos
+                .try_get(&rotxn, &OutPointKey::from(&victim_outpoint))
+                .unwrap()
+                .unwrap()
+                .output,
+            victim_output
+        );
+    }
+
+    #[test]
+    fn swap_claim_completes_pending_swap_without_ready_to_claim_state() {
+        let (_dir, env, state) = test_state();
+        let creator_key = SigningKey::from_bytes(&[13u8; 32]);
+        let creator_address = get_address(&creator_key.verifying_key());
+        let recipient_key = SigningKey::from_bytes(&[14u8; 32]);
+        let recipient_address = get_address(&recipient_key.verifying_key());
+        let swap_id = SwapId([15u8; 32]);
+
+        let locked_outpoint = OutPoint::Regular {
+            txid: Txid([16u8; 32]),
+            vout: 0,
+        };
+        let locked_output = Output {
+            address: creator_address,
+            content: OutputContent::SwapPending {
+                value: sat(10_000),
+                swap_id: swap_id.0,
+            },
+        };
+        let locked_pointed = PointedOutput {
+            outpoint: locked_outpoint,
+            output: locked_output.clone(),
+        };
+        seed_utxo_set(&env, &state, std::slice::from_ref(&locked_pointed));
+
+        let mut rwtxn = env.write_txn().unwrap();
+        let swap = Swap::new(
+            swap_id,
+            SwapDirection::L2ToL1,
+            ParentChainType::Regtest,
+            SwapTxId::from_bytes(&[1u8; 32]),
+            Some(1),
+            Some(recipient_address),
+            sat(10_000),
+            "bcrt1ql1recipient".to_owned(),
+            sat(5_000),
+            0,
+            Some(50),
+            Some(creator_address),
+        );
+        assert!(matches!(swap.state, SwapState::Pending));
+        state.save_swap(&mut rwtxn, &swap).unwrap();
+        state
+            .lock_output_to_swap(&mut rwtxn, &locked_outpoint, &swap_id)
+            .unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let proof = state
+            .get_utreexo_proof(&rotxn, std::iter::once(&locked_pointed))
+            .unwrap();
+        drop(rotxn);
+
+        let transaction = Transaction {
+            inputs: vec![(locked_outpoint, hash(&locked_pointed))],
+            proof,
+            outputs: vec![Output {
+                address: recipient_address,
+                content: OutputContent::Value(sat(10_000)),
+            }],
+            data: TxData::SwapClaim {
+                swap_id: swap_id.0,
+                l2_claimer_address: None,
+                proof_data: None,
+            },
+        };
+        let authorized_transaction =
+            authorize(&[(recipient_address, &recipient_key)], transaction)
+                .unwrap();
+        let body = Body::new(vec![authorized_transaction], vec![]);
+
+        let filled_transaction = FilledTransaction {
+            transaction: body.transactions[0].clone(),
+            spent_utxos: vec![locked_output],
+        };
+        let rotxn = env.read_txn().unwrap();
+        let mut header_accumulator = state.get_accumulator(&rotxn).unwrap();
+        let merkle_root = Body::modify_memforest(
+            &body.coinbase,
+            &[filled_transaction],
+            &mut header_accumulator.0,
+        )
+        .unwrap();
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: header_accumulator.get_roots(),
+        };
+        drop(rotxn);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state.apply_block(&mut rwtxn, &header, &body).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            state
+                .utxos
+                .try_get(&rotxn, &OutPointKey::from(&locked_outpoint))
+                .unwrap()
+                .is_none(),
+            "locked swap output was spent"
+        );
+        let completed = state.get_swap(&rotxn, &swap_id).unwrap().unwrap();
+        assert!(
+            matches!(completed.state, SwapState::Completed),
+            "pending swap was advanced and completed by the block"
+        );
+    }
+
+    #[test]
+    fn swap_create_accepts_arbitrary_l1_txid_and_populates_uniqueness_index() {
+        let (_dir, env, state) = test_state();
+        let creator_key = SigningKey::from_bytes(&[10u8; 32]);
+        let creator_address = get_address(&creator_key.verifying_key());
+        let l2_recipient = Address([11u8; 20]);
+        let parent_chain = ParentChainType::Regtest;
+        let l1_recipient_address = "bcrt1qrecipient".to_owned();
+        let l1_amount = sat(5_000);
+        let l2_amount = sat(10_000);
+        let poisoned_l1_txid = [42u8; 32];
+        let swap_id = SwapId::from_l2_to_l1(
+            &l1_recipient_address,
+            l1_amount,
+            &creator_address,
+            Some(&l2_recipient),
+        );
+
+        let funding_outpoint = OutPoint::Regular {
+            txid: Txid([12u8; 32]),
+            vout: 0,
+        };
+        let funding_output = Output {
+            address: creator_address,
+            content: OutputContent::Value(sat(11_000)),
+        };
+        let funding_pointed = PointedOutput {
+            outpoint: funding_outpoint,
+            output: funding_output.clone(),
+        };
+        seed_utxo_set(&env, &state, &[funding_pointed.clone()]);
+
+        let rotxn = env.read_txn().unwrap();
+        let proof = state
+            .get_utreexo_proof(&rotxn, std::iter::once(&funding_pointed))
+            .unwrap();
+        drop(rotxn);
+
+        let transaction = Transaction {
+            inputs: vec![(funding_outpoint, hash(&funding_pointed))],
+            proof,
+            outputs: vec![Output {
+                address: l2_recipient,
+                content: OutputContent::SwapPending {
+                    value: l2_amount,
+                    swap_id: swap_id.0,
+                },
+            }],
+            data: TxData::SwapCreate {
+                swap_id: swap_id.0,
+                parent_chain,
+                l1_txid_bytes: poisoned_l1_txid.to_vec(),
+                required_confirmations: 1,
+                l2_recipient: Some(l2_recipient),
+                l2_amount: l2_amount.to_sat(),
+                l1_recipient_address: l1_recipient_address.clone(),
+                l1_amount: l1_amount.to_sat(),
+            },
+        };
+        let authorized_transaction =
+            authorize(&[(creator_address, &creator_key)], transaction).unwrap();
+        let body = Body::new(vec![authorized_transaction], vec![]);
+
+        let filled_transaction = FilledTransaction {
+            transaction: body.transactions[0].clone(),
+            spent_utxos: vec![funding_output],
+        };
+        let rotxn = env.read_txn().unwrap();
+        let mut header_accumulator = state.get_accumulator(&rotxn).unwrap();
+        let merkle_root = Body::modify_memforest(
+            &body.coinbase,
+            &[filled_transaction],
+            &mut header_accumulator.0,
+        )
+        .unwrap();
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: header_accumulator.get_roots(),
+        };
+        drop(rotxn);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state.apply_block(&mut rwtxn, &header, &body).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let indexed = state
+            .get_swap_by_l1_txid(
+                &rotxn,
+                &parent_chain,
+                &SwapTxId::from_bytes(&poisoned_l1_txid),
+            )
+            .unwrap()
+            .expect("poisoned l1 txid should be indexed");
+        assert_eq!(indexed.id, swap_id);
+        assert_eq!(indexed.l1_txid, SwapTxId::from_bytes(&poisoned_l1_txid));
+    }
+
+    #[test]
+    fn swap_create_can_advertise_l2_amount_without_locked_escrow_output() {
+        let (_dir, env, state) = test_state();
+        let creator_key = SigningKey::from_bytes(&[13u8; 32]);
+        let creator_address = get_address(&creator_key.verifying_key());
+        let l2_recipient = Address([14u8; 20]);
+        let parent_chain = ParentChainType::Regtest;
+        let l1_recipient_address = "bcrt1qrecipient-no-escrow".to_owned();
+        let l1_amount = sat(5_000);
+        let l2_amount = sat(10_000);
+        let swap_id = SwapId::from_l2_to_l1(
+            &l1_recipient_address,
+            l1_amount,
+            &creator_address,
+            Some(&l2_recipient),
+        );
+
+        let funding_outpoint = OutPoint::Regular {
+            txid: Txid([15u8; 32]),
+            vout: 0,
+        };
+        let funding_output = Output {
+            address: creator_address,
+            content: OutputContent::Value(l2_amount),
+        };
+        let funding_pointed = PointedOutput {
+            outpoint: funding_outpoint,
+            output: funding_output.clone(),
+        };
+        seed_utxo_set(&env, &state, &[funding_pointed.clone()]);
+
+        let rotxn = env.read_txn().unwrap();
+        let proof = state
+            .get_utreexo_proof(&rotxn, std::iter::once(&funding_pointed))
+            .unwrap();
+        drop(rotxn);
+
+        let transaction = Transaction {
+            inputs: vec![(funding_outpoint, hash(&funding_pointed))],
+            proof,
+            outputs: vec![Output {
+                address: creator_address,
+                content: OutputContent::Value(l2_amount),
+            }],
+            data: TxData::SwapCreate {
+                swap_id: swap_id.0,
+                parent_chain,
+                l1_txid_bytes: [0u8; 32].to_vec(),
+                required_confirmations: 1,
+                l2_recipient: Some(l2_recipient),
+                l2_amount: l2_amount.to_sat(),
+                l1_recipient_address,
+                l1_amount: l1_amount.to_sat(),
+            },
+        };
+        let authorized_transaction =
+            authorize(&[(creator_address, &creator_key)], transaction).unwrap();
+        let body = Body::new(vec![authorized_transaction], vec![]);
+
+        let filled_transaction = FilledTransaction {
+            transaction: body.transactions[0].clone(),
+            spent_utxos: vec![funding_output],
+        };
+        let rotxn = env.read_txn().unwrap();
+        let mut header_accumulator = state.get_accumulator(&rotxn).unwrap();
+        let merkle_root = Body::modify_memforest(
+            &body.coinbase,
+            &[filled_transaction],
+            &mut header_accumulator.0,
+        )
+        .unwrap();
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: header_accumulator.get_roots(),
+        };
+        drop(rotxn);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state.apply_block(&mut rwtxn, &header, &body).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let saved_swap = state.get_swap(&rotxn, &swap_id).unwrap().unwrap();
+        assert_eq!(saved_swap.l2_amount, l2_amount);
+        let output_outpoint = OutPoint::Regular {
+            txid: body.transactions[0].txid(),
+            vout: 0,
+        };
+        assert_eq!(
+            state
+                .is_output_locked_to_swap(&rotxn, &output_outpoint)
+                .unwrap(),
+            None,
+            "SwapCreate was accepted but no output was escrow-locked to the swap"
+        );
+    }
+}
